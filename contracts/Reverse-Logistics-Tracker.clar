@@ -4,9 +4,13 @@
 (define-constant ERR_INVALID_STATUS (err u102))
 (define-constant ERR_ALREADY_EXISTS (err u103))
 (define-constant ERR_INVALID_CONDITION (err u104))
+(define-constant ERR_DISPUTE_NOT_ALLOWED (err u105))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u106))
+(define-constant ERR_DISPUTE_RESOLVED (err u107))
 
 (define-data-var next-return-id uint u1)
 (define-data-var next-product-id uint u1)
+(define-data-var next-dispute-id uint u1)
 
 (define-map returns
     { return-id: uint }
@@ -62,6 +66,28 @@
     { authorized: bool }
 )
 
+(define-map disputes
+    { dispute-id: uint }
+    {
+        return-id: uint,
+        customer: principal,
+        merchant: principal,
+        dispute-reason: (string-ascii 200),
+        evidence-hash: (string-ascii 64),
+        status: (string-ascii 20),
+        filed-at: uint,
+        resolved-at: uint,
+        arbitrator: (optional principal),
+        resolution: (optional (string-ascii 200)),
+        customer-compensation: uint,
+    }
+)
+
+(define-map authorized-arbitrators
+    { arbitrator: principal }
+    { authorized: bool }
+)
+
 (define-read-only (get-return (return-id uint))
     (map-get? returns { return-id: return-id })
 )
@@ -90,6 +116,21 @@
 
 (define-read-only (get-next-product-id)
     (var-get next-product-id)
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (is-authorized-arbitrator (arbitrator principal))
+    (default-to false
+        (get authorized
+            (map-get? authorized-arbitrators { arbitrator: arbitrator })
+        ))
+)
+
+(define-read-only (get-next-dispute-id)
+    (var-get next-dispute-id)
 )
 
 (define-public (register-product
@@ -151,6 +192,22 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
         (map-set authorized-inspectors { inspector: inspector } { authorized: false })
+        (ok true)
+    )
+)
+
+(define-public (authorize-arbitrator (arbitrator principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (map-set authorized-arbitrators { arbitrator: arbitrator } { authorized: true })
+        (ok true)
+    )
+)
+
+(define-public (revoke-arbitrator (arbitrator principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (map-set authorized-arbitrators { arbitrator: arbitrator } { authorized: false })
         (ok true)
     )
 )
@@ -289,9 +346,12 @@
     (begin
         (asserts! (is-authorized-inspector tx-sender) ERR_UNAUTHORIZED)
         (ok (map update-return-status-helper return-ids
-            (list new-status new-status new-status new-status new-status
-                new-status new-status new-status new-status new-status)
-        ))
+            (list
+                new-status                 new-status                 new-status
+                                new-status                 new-status
+                new-status                 new-status                 new-status
+                                new-status                 new-status
+            )))
     )
 )
 
@@ -493,10 +553,158 @@
     })
 )
 
+(define-public (file-dispute
+        (return-id uint)
+        (reason (string-ascii 200))
+        (evidence-hash (string-ascii 64))
+    )
+    (let (
+            (dispute-id (var-get next-dispute-id))
+            (current-time stacks-block-height)
+            (return-data (unwrap! (get-return return-id) ERR_NOT_FOUND))
+        )
+        (asserts! (is-eq tx-sender (get customer return-data)) ERR_UNAUTHORIZED)
+        (asserts!
+            (or
+                (is-eq (get status return-data) "rejected")
+                (is-eq (get status return-data) "approved")
+                (is-eq (get status return-data) "refunded")
+            )
+            ERR_DISPUTE_NOT_ALLOWED
+        )
+        (asserts! (has-no-active-dispute return-id) ERR_DISPUTE_ALREADY_EXISTS)
+        (map-set disputes { dispute-id: dispute-id } {
+            return-id: return-id,
+            customer: (get customer return-data),
+            merchant: (get merchant return-data),
+            dispute-reason: reason,
+            evidence-hash: evidence-hash,
+            status: "filed",
+            filed-at: current-time,
+            resolved-at: u0,
+            arbitrator: none,
+            resolution: none,
+            customer-compensation: u0,
+        })
+        (map-set return-dispute-tracker { return-id: return-id } {
+            dispute-id: dispute-id,
+            has-dispute: true,
+        })
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-map return-dispute-tracker
+    { return-id: uint }
+    {
+        dispute-id: uint,
+        has-dispute: bool,
+    }
+)
+
+(define-private (has-no-active-dispute (return-id uint))
+    (is-none (map-get? return-dispute-tracker { return-id: return-id }))
+)
+
+(define-public (assign-arbitrator
+        (dispute-id uint)
+        (arbitrator principal)
+    )
+    (let ((dispute-data (unwrap! (get-dispute dispute-id) ERR_NOT_FOUND)))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (is-authorized-arbitrator arbitrator) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status dispute-data) "filed") ERR_DISPUTE_RESOLVED)
+        (map-set disputes { dispute-id: dispute-id }
+            (merge dispute-data {
+                arbitrator: (some arbitrator),
+                status: "under-review",
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute
+        (dispute-id uint)
+        (resolution-text (string-ascii 200))
+        (compensation uint)
+    )
+    (let (
+            (dispute-data (unwrap! (get-dispute dispute-id) ERR_NOT_FOUND))
+            (current-time stacks-block-height)
+        )
+        (asserts!
+            (is-eq tx-sender
+                (unwrap! (get arbitrator dispute-data) ERR_UNAUTHORIZED)
+            )
+            ERR_UNAUTHORIZED
+        )
+        (asserts! (is-eq (get status dispute-data) "under-review")
+            ERR_DISPUTE_RESOLVED
+        )
+        (map-set disputes { dispute-id: dispute-id }
+            (merge dispute-data {
+                status: "resolved",
+                resolved-at: current-time,
+                resolution: (some resolution-text),
+                customer-compensation: compensation,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (appeal-dispute
+        (dispute-id uint)
+        (appeal-reason (string-ascii 200))
+    )
+    (let ((dispute-data (unwrap! (get-dispute dispute-id) ERR_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get customer dispute-data)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status dispute-data) "resolved")
+            ERR_DISPUTE_NOT_ALLOWED
+        )
+        (map-set disputes { dispute-id: dispute-id }
+            (merge dispute-data { status: "appealed" })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-disputes-by-customer (customer principal))
+    (ok (list))
+)
+
+(define-read-only (get-disputes-by-merchant (merchant principal))
+    (ok (list))
+)
+
+(define-read-only (get-pending-disputes)
+    (ok (list))
+)
+
+(define-read-only (get-dispute-summary (dispute-id uint))
+    (match (get-dispute dispute-id)
+        dispute-data (match (get-return (get return-id dispute-data))
+            return-data (ok {
+                dispute-info: dispute-data,
+                return-info: return-data,
+                days-since-filed: (if (> (get filed-at dispute-data) u0)
+                    (- stacks-block-height (get filed-at dispute-data))
+                    u0
+                ),
+            })
+            ERR_NOT_FOUND
+        )
+        ERR_NOT_FOUND
+    )
+)
+
 (define-read-only (get-contract-stats)
     (ok {
         total-products: (- (var-get next-product-id) u1),
         total-returns: (- (var-get next-return-id) u1),
+        total-disputes: (- (var-get next-dispute-id) u1),
         contract-deployed-at: u1,
     })
 )

@@ -88,6 +88,32 @@
     { authorized: bool }
 )
 
+(define-map customer-returns-count
+    { customer: principal }
+    { count: uint }
+)
+
+(define-map customer-returns-index
+    {
+        customer: principal,
+        index: uint,
+    }
+    { return-id: uint }
+)
+
+(define-map merchant-returns-count
+    { merchant: principal }
+    { count: uint }
+)
+
+(define-map merchant-returns-index
+    {
+        merchant: principal,
+        index: uint,
+    }
+    { return-id: uint }
+)
+
 (define-read-only (get-return (return-id uint))
     (map-get? returns { return-id: return-id })
 )
@@ -163,11 +189,21 @@
             (return-id (var-get next-return-id))
             (current-time stacks-block-height)
             (product-data (unwrap! (get-product product-id) ERR_NOT_FOUND))
+            (customer tx-sender)
+            (merchant (get merchant product-data))
+            (customer-count (match (map-get? customer-returns-count { customer: customer })
+                entry (get count entry)
+                u0
+            ))
+            (merchant-count (match (map-get? merchant-returns-count { merchant: merchant })
+                entry (get count entry)
+                u0
+            ))
         )
         (map-set returns { return-id: return-id } {
             product-id: product-id,
-            customer: tx-sender,
-            merchant: (get merchant product-data),
+            customer: customer,
+            merchant: merchant,
             return-reason: reason,
             status: "initiated",
             created-at: current-time,
@@ -175,6 +211,18 @@
             refund-amount: u0,
             condition: condition,
         })
+        (map-set customer-returns-index {
+            customer: customer,
+            index: customer-count,
+        } { return-id: return-id }
+        )
+        (map-set customer-returns-count { customer: customer } { count: (+ customer-count u1) })
+        (map-set merchant-returns-index {
+            merchant: merchant,
+            index: merchant-count,
+        } { return-id: return-id }
+        )
+        (map-set merchant-returns-count { merchant: merchant } { count: (+ merchant-count u1) })
         (var-set next-return-id (+ return-id u1))
         (ok return-id)
     )
@@ -348,9 +396,9 @@
         (ok (map update-return-status-helper return-ids
             (list
                 new-status                 new-status                 new-status
-                                new-status                 new-status
+                new-status                 new-status
                 new-status                 new-status                 new-status
-                                new-status                 new-status
+                new-status                 new-status
             )))
     )
 )
@@ -707,4 +755,44 @@
         total-disputes: (- (var-get next-dispute-id) u1),
         contract-deployed-at: u1,
     })
+)
+
+(define-read-only (get-customer-returns-count (customer principal))
+    (match (map-get? customer-returns-count { customer: customer })
+        entry (get count entry)
+        u0
+    )
+)
+
+(define-read-only (get-customer-return-at
+        (customer principal)
+        (index uint)
+    )
+    (match (map-get? customer-returns-index {
+        customer: customer,
+        index: index,
+    })
+        entry (some (get return-id entry))
+        none
+    )
+)
+
+(define-read-only (get-merchant-returns-count (merchant principal))
+    (match (map-get? merchant-returns-count { merchant: merchant })
+        entry (get count entry)
+        u0
+    )
+)
+
+(define-read-only (get-merchant-return-at
+        (merchant principal)
+        (index uint)
+    )
+    (match (map-get? merchant-returns-index {
+        merchant: merchant,
+        index: index,
+    })
+        entry (some (get return-id entry))
+        none
+    )
 )

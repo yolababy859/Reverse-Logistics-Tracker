@@ -51,6 +51,14 @@
     }
 )
 
+(define-map return-sla
+    { return-id: uint }
+    {
+        sla-deadline: uint,
+        sla-type: (string-ascii 20),
+    }
+)
+
 (define-map merchant-stats
     { merchant: principal }
     {
@@ -794,5 +802,55 @@
     })
         entry (some (get return-id entry))
         none
+    )
+)
+
+(define-public (set-return-sla
+        (return-id uint)
+        (deadline uint)
+        (sla-type (string-ascii 20))
+    )
+    (let ((return-data (unwrap! (get-return return-id) ERR_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get merchant return-data)) ERR_UNAUTHORIZED)
+        (map-set return-sla { return-id: return-id } {
+            sla-deadline: deadline,
+            sla-type: sla-type,
+        })
+        (ok true)
+    )
+)
+
+(define-public (clear-return-sla (return-id uint))
+    (let ((return-data (unwrap! (get-return return-id) ERR_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get merchant return-data)) ERR_UNAUTHORIZED)
+        (map-delete return-sla { return-id: return-id })
+        (ok true)
+    )
+)
+
+(define-read-only (get-return-sla (return-id uint))
+    (map-get? return-sla { return-id: return-id })
+)
+
+(define-read-only (get-return-sla-status (return-id uint))
+    (match (map-get? return-sla { return-id: return-id })
+        entry (let (
+                (deadline (get sla-deadline entry))
+                (current-height stacks-block-height)
+            )
+            (if (>= current-height deadline)
+                (ok {
+                    status: "breached",
+                    sla-deadline: deadline,
+                    blocks-remaining: u0,
+                })
+                (ok {
+                    status: "active",
+                    sla-deadline: deadline,
+                    blocks-remaining: (- deadline current-height),
+                })
+            )
+        )
+        ERR_NOT_FOUND
     )
 )
